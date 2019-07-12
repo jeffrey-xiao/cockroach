@@ -664,7 +664,7 @@ func clearRangeData(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
 	eng engine.Reader,
-	batch engine.Batch,
+	writer engine.Writer,
 	destroyData bool,
 ) error {
 	iter := eng.NewIterator(engine.IterOptions{UpperBound: desc.EndKey.AsRawKey()})
@@ -711,9 +711,9 @@ func clearRangeData(
 		}
 		var err error
 		if count > clearRangeMinKeys {
-			err = batch.ClearRange(keyRange.Start, keyRange.End)
+			err = writer.ClearRange(keyRange.Start, keyRange.End)
 		} else {
-			err = batch.ClearIterRange(iter, keyRange.Start, keyRange.End)
+			err = writer.ClearIterRange(iter, keyRange.Start, keyRange.End)
 		}
 		if err != nil {
 			return err
@@ -788,8 +788,17 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "found empty HardState for non-empty Snapshot %+v", snap)
 	}
 
+	// If we're subsuming a replica below, we don't have its last NextReplicaID,
+	// nor can we obtain it. That's OK: we can just be conservative and use the
+	// maximum possible replica ID. preDestroyRaftMuLocked will write a replica
+	// tombstone using this maximum possible replica ID, which would normally be
+	// problematic, as it would prevent this store from ever having a new replica
+	// of the removed range. In this case, however, it's copacetic, as subsumed
+	// ranges _can't_ have new replicas.
+	const subsumedNextReplicaID = math.MaxInt32
 	var lastTerm uint64
 	var raftLogSize int64
+
 	switch ss := inSnap.Strategy.(type) {
 	case *kvBatchSnapshotStrategy:
 		var stats struct {
@@ -825,15 +834,6 @@ func (r *Replica) applySnapshot(
 		// reads from the batch.
 		batch := r.store.Engine().NewWriteOnlyBatch()
 		defer batch.Close()
-
-		// If we're subsuming a replica below, we don't have its last NextReplicaID,
-		// nor can we obtain it. That's OK: we can just be conservative and use the
-		// maximum possible replica ID. preDestroyRaftMuLocked will write a replica
-		// tombstone using this maximum possible replica ID, which would normally be
-		// problematic, as it would prevent this store from ever having a new replica
-		// of the removed range. In this case, however, it's copacetic, as subsumed
-		// ranges _can't_ have new replicas.
-		const subsumedNextReplicaID = math.MaxInt32
 
 		// As part of applying the snapshot, we may need to subsume replicas that have
 		// been merged into this range. Destroy their data in the same batch in which
@@ -935,51 +935,248 @@ func (r *Replica) applySnapshot(
 		}
 		stats.commit = timeutil.Now()
 
-		// The on-disk state is now committed, but the corresponding in-memory state
-		// has not yet been updated. Any errors past this point must therefore be
-		// treated as fatal.
+	case *sstSnapshotStrategy:
+		var stats struct {
+			unreplicatedClear      time.Time
+			unreplicatedState      time.Time
+			subsumedReplicas       time.Time
+			unreplicatedLogEntries time.Time
+			ingestion              time.Time
+		}
+		log.Infof(ctx, "applying %s snapshot at index %d "+
+			"(id=%s, %d SSTables, %d log entries)",
+			snapType, snap.Metadata.Index, inSnap.SnapUUID.Short(),
+			len(ss.sss.SSTs())+1, len(ss.logEntries))
+		defer func(start time.Time) {
+			now := timeutil.Now()
+			log.Infof(ctx, "applied %s snapshot in %0.0fms [unreplicatedClear=%0.0fms unreplicatedState=%0.0fms subsumedReplicas=%0.0fms unreplicatedLogEntries=%0.0fms ingestion=%0.0fms]",
+				snapType, now.Sub(start).Seconds()*1000,
+				stats.unreplicatedClear.Sub(start).Seconds()*1000,
+				stats.unreplicatedState.Sub(stats.unreplicatedClear).Seconds()*1000,
+				stats.subsumedReplicas.Sub(stats.unreplicatedState).Seconds()*1000,
+				stats.unreplicatedLogEntries.Sub(stats.subsumedReplicas).Seconds()*1000,
+				stats.ingestion.Sub(stats.unreplicatedLogEntries).Seconds()*1000)
+		}(timeutil.Now())
 
+		unreplicatedSST, err := engine.MakeRocksDBSstFileWriter()
+		if err != nil {
+			return err
+		}
+		defer unreplicatedSST.Close()
+
+		// Clearing the unreplicated state.
+		unreplicatedPrefixKey := keys.MakeRangeIDUnreplicatedPrefix(r.RangeID)
+		unreplicatedStart := engine.MakeMVCCMetadataKey(unreplicatedPrefixKey)
+		unreplicatedEnd := engine.MakeMVCCMetadataKey(unreplicatedPrefixKey.PrefixEnd())
+		if err = unreplicatedSST.ClearRange(unreplicatedStart, unreplicatedEnd); err != nil {
+			return errors.Wrapf(err, "error clearing range of unreplicated SST writer")
+		}
+		stats.unreplicatedClear = timeutil.Now()
+
+		// Update HardState.
+		hsKey := r.raftMu.stateLoader.RaftHardStateKey()
+		var hsValue roachpb.Value
+		if err := hsValue.SetProto(&hs); err != nil {
+			return err
+		}
+		hsValue.InitChecksum(hsKey)
+		if err := engine.MVCCBlindPut(ctx, &unreplicatedSST, nil /* ms */, hsKey, hlc.Timestamp{}, hsValue, nil); err != nil {
+			return errors.Wrapf(err, "unable to write HardState to unreplicated SST writer")
+		}
+
+		// Update TruncatedState if it is unreplicated.
+		if inSnap.UsesUnreplicatedTruncatedState {
+			rsl := stateloader.Make(s.Desc.RangeID)
+			if err := engine.MVCCBlindPutProto(ctx, &unreplicatedSST, nil /* ms */, rsl.RaftTruncatedStateKey(), hlc.Timestamp{}, s.TruncatedState, nil /* txn */); err != nil {
+				return errors.Wrapf(err, "unable to write TruncatedState to unreplicated SST writer")
+			}
+		}
+
+		stats.unreplicatedState = timeutil.Now()
+
+		// Handle subsumed replicas. We create a separate SSTs with range deletion
+		// tombstones to delete the data of subsumed replicas.
+		keyRanges := rditer.MakeAllKeyRanges(s.Desc)[1:]
+		var totalKeyRanges [2]rditer.KeyRange
+		copy(totalKeyRanges[:], keyRanges)
 		for _, sr := range subsumedRepls {
-			// We removed sr's data when we committed the batch. Finish subsumption by
-			// updating the in-memory bookkeping.
-			if err := sr.postDestroyRaftMuLocked(ctx, sr.GetMVCCStats()); err != nil {
-				log.Fatalf(ctx, "unable to finish destroying %s while applying snapshot: %+v", sr, err)
+			srKeyRanges := rditer.MakeAllKeyRanges(sr.Desc())
+
+			// We have to create an SST for the subsumed replica's range-id local keys.
+			if sr.Desc().RangeID != s.Desc.RangeID {
+				subsumedReplSST, err := engine.MakeRocksDBSstFileWriter()
+				if err != nil {
+					return err
+				}
+				if err := subsumedReplSST.ClearRange(srKeyRanges[0].Start, srKeyRanges[0].End); err != nil {
+					subsumedReplSST.Close()
+					return err
+				}
+				tombstoneKey := keys.RaftTombstoneKey(sr.RangeID)
+				tombstone := &roachpb.RaftTombstone{
+					NextReplicaID: subsumedNextReplicaID,
+				}
+				if err := engine.MVCCBlindPutProto(ctx, &subsumedReplSST, nil /* ms */, tombstoneKey, hlc.Timestamp{}, tombstone, nil /* txn */); err != nil {
+					subsumedReplSST.Close()
+					return errors.Wrapf(err, "unable to write RaftTombstoneKey to subsumed replica SST")
+				}
+				if err := ss.sss.WriteAll(ctx, &subsumedReplSST); err != nil {
+					return err
+				}
 			}
-			// We already hold sr's raftMu, so we must call removeReplicaImpl directly.
-			// Note that it's safe to update the store's metadata for sr's removal
-			// separately from updating the store's metadata for r's new descriptor
-			// (i.e., under a different store.mu acquisition). Each store.mu acquisition
-			// leaves the store in a consistent state, and access to the replicas
-			// themselves is protected by their raftMus, which are held from start to
-			// finish.
-			if err := r.store.removeReplicaImpl(ctx, sr, subsumedNextReplicaID, RemoveOptions{
-				DestroyData: false, // data is already destroyed
-			}); err != nil {
-				log.Fatalf(ctx, "unable to remove %s while applying snapshot: %+v", sr, err)
+
+			// Compute the total key space covered by the current replica and all
+			// subsumed replicas.
+			for i := range srKeyRanges[1:] {
+				if srKeyRanges[i].Start.Key.Compare(totalKeyRanges[i].Start.Key) < 0 {
+					totalKeyRanges[i].Start = srKeyRanges[i].Start
+				}
+				if srKeyRanges[i].End.Key.Compare(totalKeyRanges[i].End.Key) > 0 {
+					totalKeyRanges[i].End = srKeyRanges[i].End
+				}
 			}
 		}
 
-		// Atomically swap the placeholder, if any, for the replica, and update the
-		// replica's descriptor.
-		r.store.mu.Lock()
-		if r.store.removePlaceholderLocked(ctx, r.RangeID) {
-			atomic.AddInt32(&r.store.counts.filledPlaceholders, 1)
+		// We might have to create SSTs for the range local keys and data keys
+		// depending on if the subsumed replicas are not fully contained by the
+		// descriptor in our snapshot.
+		for i := range keyRanges {
+			if totalKeyRanges[i].End.Key.Compare(keyRanges[i].End.Key) > 0 {
+				subsumedReplSST, err := engine.MakeRocksDBSstFileWriter()
+				if err != nil {
+					return err
+				}
+				if err := subsumedReplSST.ClearRange(keyRanges[i].End, totalKeyRanges[i].End); err != nil {
+					subsumedReplSST.Close()
+					return err
+				}
+				if err := ss.sss.WriteAll(ctx, &subsumedReplSST); err != nil {
+					return err
+				}
+			}
+			if totalKeyRanges[i].End.Key.Compare(keyRanges[i].End.Key) > 0 {
+				subsumedReplSST, err := engine.MakeRocksDBSstFileWriter()
+				if err != nil {
+					return err
+				}
+				if err := subsumedReplSST.ClearRange(totalKeyRanges[i].Start, keyRanges[i].Start); err != nil {
+					subsumedReplSST.Close()
+					return err
+				}
+				if err := ss.sss.WriteAll(ctx, &subsumedReplSST); err != nil {
+					return err
+				}
+			}
 		}
-		r.setDesc(ctx, s.Desc)
-		if err := r.store.maybeMarkReplicaInitializedLocked(ctx, r); err != nil {
-			log.Fatalf(ctx, "unable to mark replica initialized while applying snapshot: %+v", err)
+
+		stats.subsumedReplicas = timeutil.Now()
+
+		// Update Raft entries.
+		if len(ss.logEntries) > 0 {
+			logEntries := make([]raftpb.Entry, len(ss.logEntries))
+			for i, bytes := range ss.logEntries {
+				if err := protoutil.Unmarshal(bytes, &logEntries[i]); err != nil {
+					return err
+				}
+			}
+			// If this replica doesn't know its ReplicaID yet, we're applying a
+			// preemptive snapshot. In this case, we're going to have to write the
+			// sideloaded proposals into the Raft log. Otherwise, sideload.
+			thinEntries := logEntries
+			if replicaID != 0 {
+				var err error
+				var sideloadedEntriesSize int64
+				thinEntries, sideloadedEntriesSize, err = r.maybeSideloadEntriesRaftMuLocked(ctx, logEntries)
+				if err != nil {
+					return err
+				}
+				raftLogSize += sideloadedEntriesSize
+			}
+			var logDiff enginepb.MVCCStats
+			var logValue roachpb.Value
+			for i := range thinEntries {
+				ent := &thinEntries[i]
+				entKey := r.raftMu.stateLoader.RaftLogKey(ent.Index)
+
+				if err := logValue.SetProto(ent); err != nil {
+					return err
+				}
+				logValue.InitChecksum(entKey)
+				err = engine.MVCCBlindPut(ctx, &unreplicatedSST, &logDiff, entKey, hlc.Timestamp{},
+					logValue, nil /* txn */)
+				if err != nil {
+					return errors.Wrapf(err, "error writing log entry to unreplicated SST writer")
+				}
+			}
+			raftLogSize += logDiff.SysBytes
+			lastTerm = thinEntries[len(thinEntries)-1].Term
+		} else {
+			lastTerm = invalidLastTerm
 		}
-		r.store.mu.Unlock()
+		r.store.raftEntryCache.Drop(r.RangeID)
+		stats.unreplicatedLogEntries = timeutil.Now()
 
-		// Invoke the leasePostApply method to ensure we properly initialize the
-		// replica according to whether it holds the lease. We allow jumps in the
-		// lease sequence because there may be multiple lease changes accounted for
-		// in the snapshot.
-		r.leasePostApply(ctx, *s.Lease, true /* permitJump */)
+		if err := ss.sss.WriteAll(ctx, &unreplicatedSST); err != nil {
+			return err
+		}
+		unreplicatedSST.Close()
 
+		// Ingest all SSTs atomically.
+		log.Infof(ctx, "ingesting %d SSTables", len(ss.sss.SSTs()))
+		if err := r.store.engine.IngestExternalFiles(ctx, ss.sss.SSTs(), true /* skipWritingSeqNo */, true /* modify */); err != nil {
+			return errors.Wrapf(err, "while ingesting %s", ss.sss.SSTs())
+		}
+		stats.ingestion = timeutil.Now()
+		// REVIEW(jeffreyxiao): Should there be a compaction suggestion here? A
+		// compaction suggestion on the data range overlaps with the compaction
+		// hints in postDestroyRaftMuLocked if there are subsumed replicas. It's
+		// possible that the key range of the snapshot does not fully contain the
+		// key range of the subsumed replica.
 	default:
 		log.Fatalf(ctx, "unknown snapshot strategy: %v", ss)
 	}
+
+	// The on-disk state is now committed, but the corresponding in-memory state
+	// has not yet been updated. Any errors past this point must therefore be
+	// treated as fatal.
+
+	for _, sr := range subsumedRepls {
+		// We removed sr's data when we committed the batch. Finish subsumption by
+		// updating the in-memory bookkeping.
+		if err := sr.postDestroyRaftMuLocked(ctx, sr.GetMVCCStats()); err != nil {
+			log.Fatalf(ctx, "unable to finish destroying %s while applying snapshot: %+v", sr, err)
+		}
+		// We already hold sr's raftMu, so we must call removeReplicaImpl directly.
+		// Note that it's safe to update the store's metadata for sr's removal
+		// separately from updating the store's metadata for r's new descriptor
+		// (i.e., under a different store.mu acquisition). Each store.mu acquisition
+		// leaves the store in a consistent state, and access to the replicas
+		// themselves is protected by their raftMus, which are held from start to
+		// finish.
+		if err := r.store.removeReplicaImpl(ctx, sr, subsumedNextReplicaID, RemoveOptions{
+			DestroyData: false, // data is already destroyed
+		}); err != nil {
+			log.Fatalf(ctx, "unable to remove %s while applying snapshot: %+v", sr, err)
+		}
+	}
+
+	// Atomically swap the placeholder, if any, for the replica, and update the
+	// replica's descriptor.
+	r.store.mu.Lock()
+	if r.store.removePlaceholderLocked(ctx, r.RangeID) {
+		atomic.AddInt32(&r.store.counts.filledPlaceholders, 1)
+	}
+	r.setDesc(ctx, s.Desc)
+	if err := r.store.maybeMarkReplicaInitializedLocked(ctx, r); err != nil {
+		log.Fatalf(ctx, "unable to mark replica initialized while applying snapshot: %+v", err)
+	}
+	r.store.mu.Unlock()
+
+	// Invoke the leasePostApply method to ensure we properly initialize the
+	// replica according to whether it holds the lease. We allow jumps in the
+	// lease sequence because there may be multiple lease changes accounted for
+	// in the snapshot.
+	r.leasePostApply(ctx, *s.Lease, true /* permitJump */)
 
 	r.mu.Lock()
 	// We set the persisted last index to the last applied index. This is
